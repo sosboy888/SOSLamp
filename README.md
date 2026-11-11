@@ -4,6 +4,11 @@ A Windows desktop app for controlling **MELK / ELK-BLE / LEDBLE Bluetooth LED st
 
 The BLE protocol (packet layout, UUIDs, effect codes) is ported from the Rust project [b1scoito/elk-led-controller](https://github.com/b1scoito/elk-led-controller). Everything on top of it is new: the GUI, the audio analysis engine, auto-connect, and screen sync.
 
+<p align="center">
+  <img src="docs/images/gui.png" alt="SOSLamp main window" width="900">
+</p>
+<p align="center"><em>The main window (here with no strip connected, so the device list is empty).</em></p>
+
 ## Features
 
 - **Device discovery and auto-connect** – continuous BLE scan, connects to the first compatible strip it sees
@@ -52,21 +57,10 @@ python -m soslamp.app
 
 ## How it works
 
-```
-                       ┌──────────────────────────────┐
-  Qt GUI thread        │  SOSLampWindow (gui/)        │
-  (widgets, signals)   └──────┬───────────────▲───────┘
-                              │ submit()      │ Qt signals
-                       ┌──────▼───────────────┴───────┐
-  asyncio thread       │  BleControllerManager        │  scan, auto-connect
-  (utils/async_bridge) │  BleLedController            │  9-byte packets over GATT
-                       └──────▲───────────────────────┘
-                              │ set_color / set_brightness
-                       ┌──────┴───────────────────────┐
-  audio worker thread  │  MusicReactiveWorker         │
-                       │  ReactiveAudioEngine         │  capture → FFT → bands → color
-                       └──────────────────────────────┘
-```
+<p align="center">
+  <img src="docs/images/architecture.svg" alt="Architecture: GUI thread, asyncio thread, audio thread" width="760">
+</p>
+
 
 Qt and `bleak` each want their own event loop, so `AsyncExecutor` runs an asyncio loop on a background thread. The GUI hands it coroutines and gets results back through Qt signals, which keeps the window responsive during BLE writes.
 
@@ -77,6 +71,11 @@ Qt and `bleak` each want their own event loop, so `AsyncExecutor` runs an asynci
 3. Spectral flux (frame-to-frame increase in energy) feeds an adaptive per-band beat tracker.
 4. Bands, beats, palette and user settings become a list of colors.
 5. Because these strips take **one color + one brightness**, the worker averages the list down and smooths it before writing it over BLE.
+
+<p align="center">
+  <img src="docs/images/audio_pipeline.png" alt="Synthetic kick and hi-hat signal and the resulting brightness and color" width="760">
+</p>
+<p align="center"><em>Output of the real engine on a synthetic signal (60 Hz kick on the beat, noise hi-hat on the off-beat) with base brightness set to 20%. The strip flashes on each hit and goes dark in between because "Never go black" is off; the first 0.3 s is start-up behaviour before the noise floor settles. Regenerate with <code>scripts/make_audio_figure.py</code>.</em></p>
 
 To reduce latency, lower the buffer size in the GUI (or `LOTUSLAMP_AUDIO_BUFFER_SIZE`), or enable **Fast mode**.
 
@@ -113,8 +112,9 @@ src/soslamp/
 │   └── device_registry.py  # multi-device registry for the Wi-Fi driver
 ├── tools/                  # pcap_compare.py, send_test.py diagnostics
 └── utils/                  # asyncio bridge, config / env-var settings
-docs/                       # protocol notes and build guide
+docs/                       # protocol notes, build guide, README images
 scripts/build_exe.ps1       # PyInstaller wrapper
+scripts/make_audio_figure.py# regenerates the audio figure (needs matplotlib)
 ```
 
 ## Configuration
