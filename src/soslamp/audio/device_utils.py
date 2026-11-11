@@ -10,6 +10,9 @@ import sounddevice as sd
 
 @dataclass(slots=True)
 class AudioDeviceInfo:
+    """Small summary of one audio device so the GUI doesn't need to touch sounddevice."""
+
+    # index is None for the virtual "System Default Output" entry.
     index: int | None
     name: str
     hostapi: str
@@ -18,11 +21,14 @@ class AudioDeviceInfo:
     max_output_channels: int = 0
 
     def label(self) -> str:
+        """Text shown in the Audio Source dropdown."""
         suffix = " (Loopback)" if self.supports_loopback else ""
         return f"{self.name}{suffix} [{self.hostapi}]"
 
 
 def list_input_devices() -> list[AudioDeviceInfo]:
+    """Return every device we can record from, including loopback options."""
+    # query_devices can fail if there's no audio driver, so fall back to an empty list.
     try:
         devices = sd.query_devices()
         hostapis = sd.query_hostapis()
@@ -39,8 +45,11 @@ def list_input_devices() -> list[AudioDeviceInfo]:
         supports_loopback = False
         include = False
         if max_input > 0:
+            # Normal microphone / line-in.
             include = True
         elif "wasapi" in host.lower() and max_output > 0:
+            # WASAPI lets us record an *output* device ("loopback"), which is how we
+            # capture whatever the PC is playing.
             include = True
             supports_loopback = True
         if not include:
