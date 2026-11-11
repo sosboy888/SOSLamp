@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 470" width="860" height="470" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+  <title>SOSLamp architecture</title>
+  <desc>Three threads: the Qt GUI thread, an asyncio thread that talks to the BLE strip, and an audio worker thread that feeds colors to the strip.</desc>
+  <rect width="860" height="470" rx="14" fill="#121212"/>
+
+  <!-- Lane labels -->
+  <g fill="#9aa3b5" font-size="12" letter-spacing="0.5">
+    <text x="30" y="46">GUI THREAD</text>
+    <text x="30" y="196">ASYNCIO THREAD</text>
+    <text x="30" y="346">AUDIO THREAD</text>
+  </g>
+  <g stroke="#2a2a2a" stroke-width="1">
+    <line x1="20" y1="150" x2="840" y2="150"/>
+    <line x1="20" y1="300" x2="840" y2="300"/>
+  </g>
+
+  <!-- GUI -->
+  <rect x="230" y="22" width="400" height="100" rx="12" fill="#1f1f1f" stroke="#ff6ec4"/>
+  <text x="430" y="52" text-anchor="middle" fill="#ff6ec4" font-size="16" font-weight="700">SOSLampWindow</text>
+  <text x="430" y="76" text-anchor="middle" fill="#e6e6e6" font-size="13">PySide6 widgets, presets, color picker</text>
+  <text x="430" y="98" text-anchor="middle" fill="#e6e6e6" font-size="13">ScreenColorSampler (QTimer)</text>
+
+  <!-- BLE manager / controller -->
+  <rect x="230" y="172" width="400" height="100" rx="12" fill="#1f1f1f" stroke="#567dff"/>
+  <text x="430" y="202" text-anchor="middle" fill="#8fa8ff" font-size="16" font-weight="700">BleControllerManager</text>
+  <text x="430" y="226" text-anchor="middle" fill="#e6e6e6" font-size="13">scan, auto-connect, ensure_controller()</text>
+  <text x="430" y="248" text-anchor="middle" fill="#e6e6e6" font-size="13">BleLedController: 9-byte packets, retries</text>
+
+  <!-- Audio -->
+  <rect x="230" y="322" width="400" height="120" rx="12" fill="#1f1f1f" stroke="#567dff"/>
+  <text x="430" y="352" text-anchor="middle" fill="#8fa8ff" font-size="16" font-weight="700">MusicReactiveWorker</text>
+  <text x="430" y="376" text-anchor="middle" fill="#e6e6e6" font-size="13">ReactiveAudioEngine</text>
+  <text x="430" y="398" text-anchor="middle" fill="#e6e6e6" font-size="13">capture, FFT, bands, beat tracker, palette</text>
+  <text x="430" y="420" text-anchor="middle" fill="#e6e6e6" font-size="13">collapse to one color + brightness</text>
+
+  <!-- Strip -->
+  <rect x="700" y="196" width="130" height="52" rx="26" fill="#1f1f1f" stroke="#9aa3b5"/>
+  <text x="765" y="219" text-anchor="middle" fill="#e6e6e6" font-size="13" font-weight="700">LED strip</text>
+  <text x="765" y="236" text-anchor="middle" fill="#9aa3b5" font-size="11">BLE GATT write</text>
+
+  <!-- Mic -->
+  <rect x="30" y="352" width="130" height="52" rx="26" fill="#1f1f1f" stroke="#9aa3b5"/>
+  <text x="95" y="375" text-anchor="middle" fill="#e6e6e6" font-size="13" font-weight="700">Mic / loopback</text>
+  <text x="95" y="392" text-anchor="middle" fill="#9aa3b5" font-size="11">sounddevice</text>
+
+  <!-- Arrows -->
+  <g stroke="#9aa3b5" stroke-width="1.8" fill="none">
+    <path d="M400,122 L400,172"/>
+    <path d="M460,172 L460,122"/>
+    <path d="M630,222 L700,222"/>
+    <path d="M430,322 L430,272"/>
+    <path d="M160,378 L230,378"/>
+  </g>
+  <g fill="#9aa3b5">
+    <path d="M400,172 l-6,-10 h12 z"/>
+    <path d="M460,122 l-6,10 h12 z"/>
+    <path d="M700,222 l-10,-6 v12 z"/>
+    <path d="M430,272 l-6,10 h12 z"/>
+    <path d="M230,378 l-10,-6 v12 z"/>
+  </g>
+  <g fill="#9aa3b5" font-size="11">
+    <text x="392" y="150" text-anchor="end">executor.submit(coro)</text>
+    <text x="468" y="150">Qt signals</text>
+    <text x="440" y="302">set_color / set_brightness</text>
+  </g>
+</svg>
