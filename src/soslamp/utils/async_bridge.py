@@ -8,6 +8,7 @@ separate asyncio thread without blocking the window.
 from __future__ import annotations
 
 import asyncio
+import functools
 import threading
 from concurrent.futures import Future
 from typing import Awaitable, Callable, TypeVar
@@ -36,7 +37,8 @@ class AsyncExecutor:
 
     def call_soon(self, func: Callable[..., T], *args, **kwargs) -> None:
         """Run a plain (non-async) function on the loop thread."""
-        self._loop.call_soon_threadsafe(func, *args, **kwargs)
+        # call_soon_threadsafe only forwards positional args, so bind kwargs with partial.
+        self._loop.call_soon_threadsafe(functools.partial(func, *args, **kwargs))
 
     def stop(self) -> None:
         """Stop the loop and wait briefly for the thread to finish."""
