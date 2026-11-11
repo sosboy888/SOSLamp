@@ -49,7 +49,7 @@ class NoWheelSlider(QtWidgets.QSlider):
         event.ignore()
 
 
-# Label + bit mask for each weekday checkbox (meant for a schedule panel).
+# Label + bit mask for each weekday checkbox in the Schedule panel.
 DAY_MAPPING = [
     ("Mon", WEEK_DAYS.monday),
     ("Tue", WEEK_DAYS.tuesday),
@@ -262,7 +262,11 @@ class SOSLampWindow(QtWidgets.QMainWindow):
     def _build_ui(self) -> None:
         """Create the layout: left card = devices, right card = control panels."""
         self.setWindowTitle("SOSLamp")
-        self.resize(1100, 650)
+        self.resize(1160, 650)
+        # Create the status bar first: building the panels below can already trigger
+        # status messages (e.g. audio source selection), and _set_status needs it.
+        self.status_bar = QtWidgets.QStatusBar()
+        self.setStatusBar(self.status_bar)
         # Place the window near the top-centre of the screen instead of wherever the OS puts it.
         screen = QtWidgets.QApplication.primaryScreen()
         if screen:
@@ -328,6 +332,7 @@ class SOSLampWindow(QtWidgets.QMainWindow):
         controls_panel.addWidget(self._build_power_group())
         controls_panel.addWidget(self._build_color_group())
         controls_panel.addWidget(self._build_effect_group())
+        controls_panel.addWidget(self._build_schedule_group())
         controls_panel.addWidget(self._build_music_group())
         controls_panel.addStretch(1)
         controls_frame = QtWidgets.QFrame()
@@ -335,8 +340,6 @@ class SOSLampWindow(QtWidgets.QMainWindow):
         controls_frame.setLayout(controls_panel)
         layout.addWidget(controls_frame, 3)
 
-        self.status_bar = QtWidgets.QStatusBar()
-        self.setStatusBar(self.status_bar)
         self._apply_theme()
 
     def _apply_theme(self) -> None:
@@ -428,7 +431,8 @@ class SOSLampWindow(QtWidgets.QMainWindow):
         return group
 
     def _build_color_group(self) -> QtWidgets.QGroupBox:
-        group = QtWidgets.QGroupBox("Color & White Balance")
+        # In Qt widget text a single & marks a keyboard shortcut, so a literal one is written &&.
+        group = QtWidgets.QGroupBox("Color && White Balance")
         layout = QtWidgets.QVBoxLayout(group)
 
         color_btn = QtWidgets.QPushButton("Pick Color…")
@@ -528,6 +532,42 @@ class SOSLampWindow(QtWidgets.QMainWindow):
         self._on_effect_brightness_changed(self.effect_brightness.value())
         return group
 
+    def _build_schedule_group(self) -> QtWidgets.QGroupBox:
+        """Panel for the on/off timers that are stored on the strip itself.
+
+        One row per timer ("on" and "off"): time, weekday ticks, enable box and a Save
+        button that calls _apply_schedule(). Nothing runs on the PC afterwards, the
+        device's own clock fires the schedule (so it keeps working with the app closed).
+        """
+        group = QtWidgets.QGroupBox("Schedule")
+        layout = QtWidgets.QGridLayout(group)
+        # when -> its widgets, read back by _apply_schedule().
+        self.schedule_widgets: dict[str, dict] = {}
+        for row, (when, title, default) in enumerate(
+            [("on", "Turn on", QtCore.QTime(18, 0)), ("off", "Turn off", QtCore.QTime(23, 0))]
+        ):
+            time_edit = QtWidgets.QTimeEdit(default)
+            time_edit.setDisplayFormat("HH:mm")
+            day_checks = []
+            days_row = QtWidgets.QHBoxLayout()
+            for label, _mask in DAY_MAPPING:
+                cb = QtWidgets.QCheckBox(label)
+                cb.setChecked(True)
+                day_checks.append(cb)
+                days_row.addWidget(cb)
+            enable_cb = QtWidgets.QCheckBox("Enabled")
+            enable_cb.setChecked(True)
+            save_btn = QtWidgets.QPushButton("Save")
+            # w=when binds the current value (otherwise both buttons would use "off").
+            save_btn.clicked.connect(lambda _=False, w=when: self._apply_schedule(w))
+            layout.addWidget(QtWidgets.QLabel(title), row, 0)
+            layout.addWidget(time_edit, row, 1)
+            layout.addLayout(days_row, row, 2)
+            layout.addWidget(enable_cb, row, 3)
+            layout.addWidget(save_btn, row, 4)
+            self.schedule_widgets[when] = {"time": time_edit, "enable": enable_cb, "days": day_checks}
+        return group
+
     def _build_music_group(self) -> QtWidgets.QGroupBox:
         """Build the big Music Reactive panel (audio source, tuning, presets, screen sync).
 
@@ -538,6 +578,12 @@ class SOSLampWindow(QtWidgets.QMainWindow):
         layout = QtWidgets.QVBoxLayout(group)
         device_row = QtWidgets.QHBoxLayout()
         self.audio_device_combo = QtWidgets.QComboBox()
+        # Without this the combo grows to fit the longest device name and stretches the whole
+        # window; long names are elided instead.
+        self.audio_device_combo.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.audio_device_combo.setMinimumContentsLength(24)
         device_refresh = QtWidgets.QPushButton("Refresh Inputs")
         device_refresh.clicked.connect(self._refresh_audio_devices)
         self.audio_device_combo.currentIndexChanged.connect(self._apply_audio_device_selection)
@@ -720,9 +766,6 @@ class SOSLampWindow(QtWidgets.QMainWindow):
         self.music_gate_slider.valueChanged.connect(self._on_music_gate_changed)
         self.music_gate_slider.sliderReleased.connect(self._apply_music_beat_gate)
         self.music_gate_slider.setToolTip("Beat gate sensitivity. Lower = opens only on strong kicks. Example: 10% for EDM.")
-
-        # NOTE: music_melody_label is created again further down; this first copy is redundant.
-        self.music_melody_label = QtWidgets.QLabel("Melody focus (tonal boost): 25%")
 
         self.music_strobe_checkbox = QtWidgets.QCheckBox("Strobe on strong hits")
         self.music_strobe_checkbox.setChecked(False)
@@ -1187,13 +1230,16 @@ class SOSLampWindow(QtWidgets.QMainWindow):
         layout.addWidget(self.music_base_slider)
         layout.addWidget(self.music_max_label)
         layout.addWidget(self.music_max_slider)
-        preset_row = QtWidgets.QHBoxLayout()
-        preset_row.addWidget(QtWidgets.QLabel("Presets"))
-        for name in self.music_presets.keys():
+        # Grid instead of one long row: 14 buttons side by side made the whole window
+        # wider than the screen. 4 per row keeps it compact.
+        preset_row = QtWidgets.QGridLayout()
+        preset_row.addWidget(QtWidgets.QLabel("Presets"), 0, 0, 1, 4)
+        for i, name in enumerate(self.music_presets.keys()):
             # n=name binds the current name; without it every button would use the last preset.
-            btn = QtWidgets.QPushButton(name)
+            # Escape & here too ("Drum & Bass"); the dict key stays unescaped.
+            btn = QtWidgets.QPushButton(name.replace("&", "&&"))
             btn.clicked.connect(lambda _, n=name: self._apply_music_preset(n))
-            preset_row.addWidget(btn)
+            preset_row.addWidget(btn, 1 + i // 4, i % 4)
         layout.addLayout(preset_row)
         layout.addLayout(mode_row)
         layout.addWidget(self.music_vertical_checkbox)
@@ -1461,9 +1507,8 @@ class SOSLampWindow(QtWidgets.QMainWindow):
         # Currently 1:1 with the slider (clamped); kept as a function in case the mapping changes.
         return max(0, min(100, slider_value))
 
-    # NOTE: this reads self.schedule_widgets, but no schedule panel is built yet, so nothing
-    # calls it. The BLE layer already supports schedules; the GUI part is still TODO.
     def _apply_schedule(self, when: str) -> None:
+        """Read the \"on\" or \"off\" row of the Schedule panel and send it to the strip."""
         widgets = self.schedule_widgets[when]
         time_edit: QtWidgets.QTimeEdit = widgets["time"]
         enable_cb: QtWidgets.QCheckBox = widgets["enable"]
