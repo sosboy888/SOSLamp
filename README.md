@@ -145,6 +145,10 @@ The app is written to `dist/SOSLamp/`. Details in [docs/BUILD_EXE.md](docs/BUILD
 - Loopback capture relies on WASAPI, so system-audio mode is Windows only.
 - Planned: per-effect tuning, saved presets per room, packaged installer with auto-update.
 
+## Project history
+
+SOSLamp was built over 2025 and early 2026 as a personal project, but I didn't use version control while developing it. This repository was created in November 2026 from the finished code, so the commit history starts then and doesn't reflect when the work was done. The comments, README and cleanup were added at that point.
+
 ## Credits
 
 BLE protocol and effect codes: [elk-led-controller](https://github.com/b1scoito/elk-led-controller) by b1scoito.
