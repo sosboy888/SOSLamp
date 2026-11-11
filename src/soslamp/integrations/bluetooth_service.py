@@ -1,4 +1,9 @@
-"""Bluetooth discovery helpers for MELK controllers."""
+"""Bluetooth discovery helpers for MELK controllers.
+
+bleak only finds devices that are *advertising*. A strip that is already
+connected to the OS stops advertising, so we also ask the operating system
+which devices it has connected.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +16,8 @@ from typing import Optional
 
 @dataclass(slots=True)
 class BluetoothDeviceInfo:
+    """One Bluetooth device from either bleak or the OS command line tools."""
+
     name: str
     address: str
     connected: bool = False
@@ -29,11 +36,14 @@ class BluetoothDiscoveryService:
         self.timeout = timeout
 
     async def discover(self) -> list[BluetoothDeviceInfo]:
+        # Run the bleak scan and the (blocking) OS query at the same time to save waiting.
         bleak_task = asyncio.create_task(self._discover_bleak())
+        # to_thread moves the blocking subprocess call off the event loop.
         cli_task = asyncio.to_thread(self._connected_from_cli)
         bleak_devices, cli_devices = await asyncio.gather(
             bleak_task, cli_task, return_exceptions=False
         )
+        # Merge by address so a device found by both methods only shows up once.
         merged: dict[str, BluetoothDeviceInfo] = {}
         for device in [*bleak_devices, *cli_devices]:
             if self.prefix and device.name and not device.name.upper().startswith(self.prefix.upper()):
@@ -42,6 +52,7 @@ class BluetoothDiscoveryService:
         return list(merged.values())
 
     async def _discover_bleak(self) -> list[BluetoothDeviceInfo]:
+        # Imported here so the rest of the module still works if bleak isn't installed.
         try:
             from bleak import BleakScanner
         except ImportError:
@@ -66,6 +77,7 @@ class BluetoothDiscoveryService:
         return infos
 
     def _connected_from_cli(self) -> list[BluetoothDeviceInfo]:
+        """Pick the right OS-specific way to list connected devices."""
         system = platform.system().lower()
         if "linux" in system:
             return self._from_bluetoothctl()
@@ -76,6 +88,7 @@ class BluetoothDiscoveryService:
         return []
 
     def _from_bluetoothctl(self) -> list[BluetoothDeviceInfo]:
+        # Linux: `bluetoothctl devices Connected` prints lines like "Device AA:BB:.. Name".
         try:
             proc = subprocess.run(
                 ["bluetoothctl", "devices", "Connected"],
@@ -87,6 +100,7 @@ class BluetoothDiscoveryService:
             return []
         infos: list[BluetoothDeviceInfo] = []
         for line in proc.stdout.strip().splitlines():
+            # Split into at most 3 parts so names containing spaces stay together.
             parts = line.strip().split(" ", 2)
             if len(parts) >= 3:
                 _, address, name = parts
@@ -94,6 +108,7 @@ class BluetoothDiscoveryService:
         return infos
 
     def _from_macos(self) -> list[BluetoothDeviceInfo]:
+        # macOS: parse the plain-text output of system_profiler line by line.
         cmd = [
             "system_profiler",
             "SPBluetoothDataType",
@@ -124,6 +139,7 @@ class BluetoothDiscoveryService:
 
     def _from_windows(self) -> list[BluetoothDeviceInfo]:
         # Query paired devices via PowerShell; requires Windows 10+.
+        # Note: this output parsing is a best guess and the address it builds is approximate.
         cmd = [
             "powershell",
             "-NoProfile",
