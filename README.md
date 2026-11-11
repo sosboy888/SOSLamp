@@ -75,7 +75,7 @@ Qt and `bleak` each want their own event loop, so `AsyncExecutor` runs an asynci
 <p align="center">
   <img src="docs/images/audio_pipeline.png" alt="Synthetic kick and hi-hat signal and the resulting brightness and color" width="760">
 </p>
-<p align="center"><em>Output of the real engine on a synthetic signal (60 Hz kick on the beat, noise hi-hat on the off-beat) with base brightness set to 20%. The strip flashes on each hit and goes dark in between because "Never go black" is off; the first 0.3 s is start-up behaviour before the noise floor settles. Regenerate with <code>scripts/make_audio_figure.py</code>.</em></p>
+<p align="center"><em>Output of the real engine on a synthetic signal (60 Hz kick on the beat, noise hi-hat on the off-beat) with base brightness set to 20%. The color flashes on each hit and is black in between (brightness only dips to about 40% because of the band envelope, but black stays dark); the first 0.3 s is start-up behaviour before the noise floor settles. Regenerate with <code>scripts/make_audio_figure.py</code>.</em></p>
 
 To reduce latency, lower the buffer size in the GUI (or `LOTUSLAMP_AUDIO_BUFFER_SIZE`), or enable **Fast mode**.
 
@@ -112,6 +112,7 @@ src/soslamp/
 │   └── device_registry.py  # multi-device registry for the Wi-Fi driver
 ├── tools/                  # pcap_compare.py, send_test.py diagnostics
 └── utils/                  # asyncio bridge, config / env-var settings
+tests/                      # unit tests (BLE packets, audio engine / worker)
 docs/                       # protocol notes, build guide, README images
 scripts/build_exe.ps1       # PyInstaller wrapper
 scripts/make_audio_figure.py# regenerates the audio figure (needs matplotlib)
@@ -128,6 +129,14 @@ Defaults live in `src/soslamp/utils/config.py`; most can be overridden with envi
 | `LOTUSLAMP_AUDIO_SILENCE_GATE` | `0.001` | RMS below this counts as silence |
 | `LOTUSLAMP_MUSIC_MAX_BRIGHTNESS` | `100` | brightness cap in music mode |
 
+## Running the tests
+
+```powershell
+python -m unittest discover -s tests -v
+```
+
+The tests use only the standard library plus the app's own dependencies.
+
 ## Building a Windows executable
 
 ```powershell
@@ -139,8 +148,8 @@ The app is written to `dist/SOSLamp/`. Details in [docs/BUILD_EXE.md](docs/BUILD
 
 ## Known limitations and roadmap
 
-- **No automated tests yet.** The BLE and audio paths need real hardware, so they are currently checked manually.
-- **Schedules** (timed on/off stored on the strip) are implemented in the BLE layer but have no GUI panel yet.
+- **Limited tests.** Unit tests cover the BLE packet builders (colour, brightness, effects, schedules, clock sync), device-name detection, and the audio worker/engine (silence, keep-lit, drop detector). Actual Bluetooth writes and the GUI need hardware or a display, so those are checked manually.
+- **Schedules** (timed on/off stored on the strip) have a GUI panel and the packets are unit-tested, but I haven't confirmed that every strip model honors them.
 - The Wi-Fi/UDP driver is experimental; Bluetooth is the main supported path.
 - Loopback capture relies on WASAPI, so system-audio mode is Windows only.
 - Planned: per-effect tuning, saved presets per room, packaged installer with auto-update.
