@@ -1,4 +1,14 @@
-"""Qt UI for the BLE-based SOSLamp controller."""
+"""Qt UI for the BLE-based SOSLamp controller.
+
+This file has two classes:
+  * ScreenColorSampler - samples the screen colour on a timer (Ambilight-style).
+  * SOSLampWindow - the main window: device list, power/colour/effects panels and
+    the (long) Music Reactive panel.
+
+Threading rule to remember: Qt widgets may only be touched from the
+GUI thread, but BLE work runs on the asyncio thread. So async code never edits
+widgets directly - it emits a Qt signal (see UiSignals) and the GUI thread handles it.
+"""
 
 from __future__ import annotations
 
@@ -29,10 +39,17 @@ from soslamp.utils.config import (
 
 
 class NoWheelSlider(QtWidgets.QSlider):
+    """Slider that ignores the mouse wheel.
+
+    The panel is inside a scroll area, so without this, scrolling the page over a
+    slider would change its value by accident.
+    """
+
     def wheelEvent(self, event: QtGui.QWheelEvent) -> None:  # noqa: N802
         event.ignore()
 
 
+# Label + bit mask for each weekday checkbox (meant for a schedule panel).
 DAY_MAPPING = [
     ("Mon", WEEK_DAYS.monday),
     ("Tue", WEEK_DAYS.tuesday),
@@ -45,6 +62,8 @@ DAY_MAPPING = [
 
 
 class UiSignals(QtCore.QObject):
+    """Signals used to safely send results from background threads to the GUI thread."""
+
     ble_devices = QtCore.Signal(list)
     status_message = QtCore.Signal(str)
     connection_status = QtCore.Signal(str)
@@ -52,11 +71,15 @@ class UiSignals(QtCore.QObject):
     audio_error = QtCore.Signal(str)
 
 
-DEFAULT_EFFECT_CODE = 0x00  # device "power-on" effect
+DEFAULT_EFFECT_CODE = 0x00  # device "power-on" effect (first entry in the effect dropdown)
 
 
 class ScreenColorSampler(QtCore.QObject):
-    """Grabs the screen and pushes the dominant/average color to the controller."""
+    """Grabs the screen and pushes the dominant/average color to the controller.
+
+    A QTimer calls _sample() every interval_ms. Each sample: grab the screen ->
+    shrink it -> pick a colour -> brighten/smooth it -> send it to the strip.
+    """
 
     def __init__(
         self,
@@ -75,6 +98,7 @@ class ScreenColorSampler(QtCore.QObject):
         super().__init__(parent)
         self.executor = executor
         self.manager = manager
+        # Tuning values (the GUI changes smoothing/edge/mode/region at runtime).
         self.interval_ms = interval_ms
         self.boost = boost
         self.target_luma = target_luma
@@ -85,6 +109,7 @@ class ScreenColorSampler(QtCore.QObject):
         self.smoothing = smoothing
         self.monitor_index: int | None = None
         self.region: str = "full"
+        # QTimer fires on the GUI thread, which is what we need for grabbing the screen.
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self._sample)
         self._last_rgb: tuple[int, int, int] | None = None
@@ -113,12 +138,15 @@ class ScreenColorSampler(QtCore.QObject):
         self.edge_emphasis = float(np.clip(amt, 0.0, 2.0))
 
     def _sample(self) -> None:
+        """Take one screenshot sample and send the resulting colour to the strip."""
         screens = QtWidgets.QApplication.screens()
         if not screens:
             return
+        # Use the chosen monitor, or the first one if the index is missing/out of range.
         screen = screens[self.monitor_index] if self.monitor_index is not None and self.monitor_index < len(screens) else screens[0]
         geo = screen.geometry()
         x, y, w, h = geo.x(), geo.y(), geo.width(), geo.height()
+        # Optionally only look at one half of the screen.
         if self.region == "left":
             w //= 2
         elif self.region == "right":
@@ -134,6 +162,7 @@ class ScreenColorSampler(QtCore.QObject):
         pixmap = screen.grabWindow(0, x, y, w, h)
         if pixmap.isNull():
             return
+        # Shrink to 80x80 first: we only want a colour, and fewer pixels = much faster maths.
         img = (
             pixmap.toImage()
             .convertToFormat(QtGui.QImage.Format_RGBA8888)
@@ -141,12 +170,14 @@ class ScreenColorSampler(QtCore.QObject):
         )
         if img.isNull():
             return
+        # sizeInBytes() isn't available in every Qt binding version, so fall back to the manual calculation.
         try:
             byte_len = img.sizeInBytes()
         except AttributeError:
             byte_len = img.bytesPerLine() * img.height()
         if byte_len <= 0:
             return
+        # View the image memory as a numpy array (H x W x 4 RGBA), then drop alpha.
         ptr = img.bits()
         arr = np.frombuffer(ptr, dtype=np.uint8, count=byte_len)
         if arr.size == 0:
@@ -155,12 +186,15 @@ class ScreenColorSampler(QtCore.QObject):
         h, w = arr.shape[:2]
         ys = np.linspace(0.0, 1.0, h, dtype=np.float32)
         xs = np.linspace(0.0, 1.0, w, dtype=np.float32)
+        # Edge weighting: pixels near the screen border count more (that's what's around the strip).
         wx = np.minimum(xs, 1 - xs)
         wy = np.minimum(ys, 1 - ys)
         edge_weight = 1.0 + self.edge_emphasis * (1.0 - np.outer(wy, wx))
+        # Two modes: "standout" = the single most vivid pixel, otherwise a weighted average.
         if self.mode == "standout":
             maxc = arr.max(axis=2)
             minc = arr.min(axis=2)
+            # Saturation x brightness = how "vibrant" a pixel is (1e-3 avoids dividing by zero).
             sat = (maxc - minc) / (maxc + 1e-3)
             val = maxc / 255.0
             prominence = sat * val * edge_weight
@@ -171,6 +205,7 @@ class ScreenColorSampler(QtCore.QObject):
             norm = np.sum(edge_weight) + 1e-6
             base_rgb = weighted.sum(axis=(0, 1)) / norm
         # Brightness compensation: target a minimum luma and apply a limited gain.
+        # (luma = perceived brightness; the weights are the standard Rec.709 coefficients)
         luma = float(0.2126 * base_rgb[0] + 0.7152 * base_rgb[1] + 0.0722 * base_rgb[2])
         gain = max(self.boost, self.target_luma / max(luma, 1e-3))
         gain = min(gain, self.max_gain)
@@ -180,11 +215,13 @@ class ScreenColorSampler(QtCore.QObject):
             scale = self.min_value / max(peak, 1e-3)
             boosted *= scale
         rgb_arr = boosted
+        # Blend with the previous colour so the lamp doesn't flicker on every frame change.
         if self._last_rgb is not None:
             prev = np.array(self._last_rgb, dtype=np.float32)
             rgb_arr = (1 - self.smoothing) * rgb_arr + self.smoothing * prev
         rgb = tuple(int(np.clip(v, 0, 255)) for v in rgb_arr)
         self._last_rgb = rgb_arr
+        # Fire-and-forget: the BLE write runs on the asyncio thread so the GUI never waits on it.
         try:
             self.executor.submit(self.manager.set_color(rgb))
         except Exception:
@@ -192,32 +229,41 @@ class ScreenColorSampler(QtCore.QObject):
 
 
 class SOSLampWindow(QtWidgets.QMainWindow):
+    """Main application window."""
+
     def __init__(self, executor: AsyncExecutor) -> None:
         super().__init__()
         self.executor = executor
         self.manager = BleControllerManager()
+        # Pass the *method* (not its result) so the worker always asks for the current controller.
         self.music_worker = MusicReactiveWorker(self.manager.controller)
         self.audio_devices: list[AudioDeviceInfo] = []
         self.selected_audio_device: AudioDeviceInfo | None = None
+        # Settings saved when "Fast mode" is switched on, so switching it off can restore them.
         self._fast_snapshot: dict[str, int | bool] = {}
         self.screen_sampler = ScreenColorSampler(self.executor, self.manager, parent=self)
+        # Wire each signal to the GUI method that handles it.
         self.signals = UiSignals()
         self.signals.ble_devices.connect(self._populate_devices)
         self.signals.status_message.connect(self._set_status)
         self.signals.connection_status.connect(self._update_connection_label)
         self.signals.music_color.connect(self._update_music_preview)
         self.signals.audio_error.connect(self._set_status)
+        # These callbacks fire on other threads, so they only emit signals (never touch widgets).
         self.music_worker.set_observer(lambda data, b: self.signals.music_color.emit((data, b)))
         self.music_worker.set_drop_notifier(lambda msg: self.signals.status_message.emit(msg))
         self.music_worker.engine.set_error_handler(lambda msg: self.signals.audio_error.emit(msg))
         self._screens: list[QtGui.QScreen] = []
         self._build_ui()
+        # Kick off a scan straight away and auto-connect to the first strip we find.
         self._set_status("SOSLamp module loaded – scanning for devices…")
         self._refresh_devices(auto_connect=True)
 
     def _build_ui(self) -> None:
+        """Create the layout: left card = devices, right card = control panels."""
         self.setWindowTitle("SOSLamp")
         self.resize(1100, 650)
+        # Place the window near the top-centre of the screen instead of wherever the OS puts it.
         screen = QtWidgets.QApplication.primaryScreen()
         if screen:
             avail = screen.availableGeometry()
@@ -231,6 +277,7 @@ class SOSLampWindow(QtWidgets.QMainWindow):
         self.setCentralWidget(central)
         central_layout = QtWidgets.QVBoxLayout(central)
 
+        # Everything lives in a scroll area because the Music panel is very tall.
         scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
         content = QtWidgets.QWidget()
@@ -239,6 +286,7 @@ class SOSLampWindow(QtWidgets.QMainWindow):
 
         root_layout = QtWidgets.QVBoxLayout(content)
 
+        # objectName lets the stylesheet in _apply_theme target this specific label.
         hero = QtWidgets.QLabel("SOSLamp")
         hero.setObjectName("HeroLabel")
         hero.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
@@ -273,6 +321,7 @@ class SOSLampWindow(QtWidgets.QMainWindow):
         device_frame = QtWidgets.QFrame()
         device_frame.setObjectName("CardFrame")
         device_frame.setLayout(device_panel)
+        # The numbers (2 and 3) are stretch factors: the right card gets 3/5 of the width.
         layout.addWidget(device_frame, 2)
 
         controls_panel = QtWidgets.QVBoxLayout()
@@ -291,11 +340,13 @@ class SOSLampWindow(QtWidgets.QMainWindow):
         self._apply_theme()
 
     def _apply_theme(self) -> None:
+        """Apply the dark theme with a Qt stylesheet (like CSS) built from COLOR_THEME."""
         accent = COLOR_THEME.accent
         accent_alt = COLOR_THEME.accent_alt
         panel = COLOR_THEME.panel
         background = COLOR_THEME.background
         self.setStyleSheet(
+            # Doubled braces {{ }} are needed because this is an f-string.
             f"""
             QWidget {{
                 background-color: {background};
@@ -363,10 +414,12 @@ class SOSLampWindow(QtWidgets.QMainWindow):
             """
         )
 
+    # --- UI builders: each returns a QGroupBox panel that _build_ui adds to the layout ---
     def _build_power_group(self) -> QtWidgets.QGroupBox:
         group = QtWidgets.QGroupBox("Power")
         layout = QtWidgets.QHBoxLayout(group)
         on_btn = QtWidgets.QPushButton("Power On")
+        # The lambda creates the coroutine at click time; _run_async sends it to the asyncio thread.
         on_btn.clicked.connect(lambda: self._run_async(self.manager.power_on(), "Powered on"))
         off_btn = QtWidgets.QPushButton("Power Off")
         off_btn.clicked.connect(lambda: self._run_async(self.manager.power_off(), "Powered off"))
@@ -385,6 +438,8 @@ class SOSLampWindow(QtWidgets.QMainWindow):
         self.brightness_slider = NoWheelSlider(QtCore.Qt.Horizontal)
         self.brightness_slider.setRange(5, 100)
         self.brightness_slider.setValue(80)
+        # sliderReleased = only send to the lamp when the user lets go (not on every tiny movement,
+        # which would flood the Bluetooth connection).
         self.brightness_slider.sliderReleased.connect(self._apply_brightness)
         layout.addWidget(QtWidgets.QLabel("Brightness"))
         layout.addWidget(self.brightness_slider)
@@ -406,6 +461,8 @@ class SOSLampWindow(QtWidgets.QMainWindow):
         group = QtWidgets.QGroupBox("Effects")
         layout = QtWidgets.QGridLayout(group)
 
+        # Name shown in the dropdown -> effect code sent to the device.
+        # ("Crossfade Rainbow" uses the raw code 0x01, which is not in the EFFECTS table.)
         presets = OrderedDict(
             [
                 ("Power On", DEFAULT_EFFECT_CODE),
@@ -433,6 +490,7 @@ class SOSLampWindow(QtWidgets.QMainWindow):
         self.effect_speed = NoWheelSlider(QtCore.Qt.Horizontal)
         self.effect_speed.setRange(1, 100)
         self.effect_speed.setValue(10)
+        # Lower number = faster on the device, hence the "fast <-> slow" label.
         self.effect_speed_label = QtWidgets.QLabel("Speed (fast ←→ slow)")
         self.effect_speed_value = QtWidgets.QLabel("")
         self.effect_speed.valueChanged.connect(self._on_effect_speed_changed)
@@ -453,6 +511,7 @@ class SOSLampWindow(QtWidgets.QMainWindow):
 
         self.custom_effect_spin = QtWidgets.QSpinBox()
         self.custom_effect_spin.setRange(0, 255)
+        # Hex spin box so any effect code can be tried while exploring the protocol.
         self.custom_effect_spin.setPrefix("0x")
         self.custom_effect_spin.setDisplayIntegerBase(16)
         custom_btn = QtWidgets.QPushButton("Send Custom Code")
@@ -470,6 +529,11 @@ class SOSLampWindow(QtWidgets.QMainWindow):
         return group
 
     def _build_music_group(self) -> QtWidgets.QGroupBox:
+        """Build the big Music Reactive panel (audio source, tuning, presets, screen sync).
+
+        It's long because every tuning option has its own widget. Pattern used for each one:
+        create widget -> connect its signal to an _apply_* method -> add it to the layout.
+        """
         group = QtWidgets.QGroupBox("Music Reactive")
         layout = QtWidgets.QVBoxLayout(group)
         device_row = QtWidgets.QHBoxLayout()
@@ -482,11 +546,12 @@ class SOSLampWindow(QtWidgets.QMainWindow):
         device_row.addWidget(device_refresh)
         layout.addLayout(device_row)
 
+        # Loopback = record what the PC is playing instead of using the microphone.
         self.loopback_checkbox = QtWidgets.QCheckBox("Capture speaker output (loopback)")
         self.loopback_checkbox.toggled.connect(lambda _: self._apply_audio_device_selection())
         layout.addWidget(self.loopback_checkbox)
 
-        # Audio analysis settings
+        # Audio analysis settings. Initial values come from utils/config.py; tooltips explain each one.
         self.music_buffer_spin = QtWidgets.QSpinBox()
         self.music_buffer_spin.setRange(64, 4096)
         self.music_buffer_spin.setSingleStep(64)
@@ -565,6 +630,7 @@ class SOSLampWindow(QtWidgets.QMainWindow):
         self.music_ambient_checkbox.setToolTip("During silence, rotate through colors instead of holding still.")
         layout.addWidget(self.music_ambient_checkbox)
 
+        # Keep the config defaults inside the slider range, and make sure max >= base.
         base_default = max(5, min(MUSIC_BASE_BRIGHTNESS, 100))
         max_default = max(base_default, min(MUSIC_MAX_BRIGHTNESS, 100))
 
@@ -655,6 +721,7 @@ class SOSLampWindow(QtWidgets.QMainWindow):
         self.music_gate_slider.sliderReleased.connect(self._apply_music_beat_gate)
         self.music_gate_slider.setToolTip("Beat gate sensitivity. Lower = opens only on strong kicks. Example: 10% for EDM.")
 
+        # NOTE: music_melody_label is created again further down; this first copy is redundant.
         self.music_melody_label = QtWidgets.QLabel("Melody focus (tonal boost): 25%")
 
         self.music_strobe_checkbox = QtWidgets.QCheckBox("Strobe on strong hits")
@@ -748,6 +815,8 @@ class SOSLampWindow(QtWidgets.QMainWindow):
         self.music_palette_combo.currentIndexChanged.connect(self._apply_music_palette)
         palette_row.addWidget(self.music_palette_combo, 1)
 
+        # One-click presets: each dict holds every setting for a genre/mood. _apply_music_preset()
+        # copies the values into the widgets. Missing keys fall back to defaults (see .get calls there).
         self.music_presets = OrderedDict(
             {
                 "Balanced Live": {
@@ -1075,6 +1144,7 @@ class SOSLampWindow(QtWidgets.QMainWindow):
         preview_row.addWidget(self.music_color_label, 1)
 
         # Apply bracketed descriptions with smaller font.
+        # (Repetitive, but each label needs its own text; a helper dict could tidy this up later.)
         self._set_label_with_desc(
             self.music_base_label, "Base brightness", "floor on quiet", self.music_base_slider.value()
         )
@@ -1112,6 +1182,7 @@ class SOSLampWindow(QtWidgets.QMainWindow):
             self.music_centroid_label, "Hue follows spectrum", "bias amount", self.music_centroid_amount.value()
         )
 
+        # Now add everything to the panel in display order.
         layout.addWidget(self.music_base_label)
         layout.addWidget(self.music_base_slider)
         layout.addWidget(self.music_max_label)
@@ -1119,6 +1190,7 @@ class SOSLampWindow(QtWidgets.QMainWindow):
         preset_row = QtWidgets.QHBoxLayout()
         preset_row.addWidget(QtWidgets.QLabel("Presets"))
         for name in self.music_presets.keys():
+            # n=name binds the current name; without it every button would use the last preset.
             btn = QtWidgets.QPushButton(name)
             btn.clicked.connect(lambda _, n=name: self._apply_music_preset(n))
             preset_row.addWidget(btn)
@@ -1173,6 +1245,7 @@ class SOSLampWindow(QtWidgets.QMainWindow):
         layout.addLayout(palette_row)
         layout.addLayout(preview_row)
 
+        # Checkable button = acts as an on/off switch; toggled(bool) fires when it flips.
         self.music_toggle = QtWidgets.QPushButton("Enable Audio Reactive")
         self.music_toggle.setCheckable(True)
         self.music_toggle.toggled.connect(self._toggle_music)
@@ -1180,6 +1253,7 @@ class SOSLampWindow(QtWidgets.QMainWindow):
         layout.addWidget(
             QtWidgets.QLabel("Uses microphone FFT to push colors directly to the connected strip.")
         )
+        # --- Screen colour sync controls (they drive ScreenColorSampler) ---
         self.screen_sync_toggle = QtWidgets.QPushButton("Enable Screen Color Sync")
         self.screen_sync_toggle.setCheckable(True)
         self.screen_sync_toggle.toggled.connect(self._toggle_screen_sync)
@@ -1219,6 +1293,7 @@ class SOSLampWindow(QtWidgets.QMainWindow):
         self.screen_edge_slider.valueChanged.connect(self._on_screen_edge_changed)
         edge_row.addWidget(self.screen_edge_slider, 1)
         layout.addLayout(edge_row)
+        # Push every widget's initial value into the worker so the UI and engine start in sync.
         self._refresh_audio_devices()
         self._apply_music_audio_params()
         self._apply_music_brightness_settings()
@@ -1240,11 +1315,14 @@ class SOSLampWindow(QtWidgets.QMainWindow):
         self._refresh_screens()
         return group
 
+    # --- Device scanning / connecting ---
+    # Pattern: submit a coroutine to the asyncio thread, then handle the result in a done-callback.
     def _refresh_devices(self, auto_connect: bool = True) -> None:
         future = self.executor.submit(self.manager.refresh(auto_connect=auto_connect))
         future.add_done_callback(self._handle_device_refresh)
 
     def _handle_device_refresh(self, future) -> None:
+        # Runs on the asyncio thread, hence signals instead of direct widget updates.
         try:
             devices = future.result()
         except Exception as exc:  # pragma: no cover - GUI path
@@ -1261,6 +1339,7 @@ class SOSLampWindow(QtWidgets.QMainWindow):
 
     def _populate_devices(self, devices: list[BleDeviceInfo]) -> None:
         self.device_list.clear()
+        # Store the address inside each list item so we know which device was picked later.
         for dev in devices:
             item = QtWidgets.QListWidgetItem(dev.label())
             item.setData(QtCore.Qt.UserRole, dev.address)
@@ -1276,6 +1355,7 @@ class SOSLampWindow(QtWidgets.QMainWindow):
         future.add_done_callback(lambda f, addr=address: self._handle_connect(f, addr))
 
     def _refresh_screens(self) -> None:
+        """Fill the monitor dropdown for screen sync (blockSignals avoids triggering handlers)."""
         self._screens = QtWidgets.QApplication.screens()
         self.screen_monitor_combo.blockSignals(True)
         self.screen_monitor_combo.clear()
@@ -1296,6 +1376,7 @@ class SOSLampWindow(QtWidgets.QMainWindow):
         label = info.name if info else address
         self.signals.connection_status.emit(f"Connected to {label}")
         self.signals.status_message.emit("Connected")
+        # connect() powers the strip on, so switch it back off; the user decides when to turn it on.
         self._silent_power_off()
 
     def _disconnect(self) -> None:
@@ -1311,11 +1392,14 @@ class SOSLampWindow(QtWidgets.QMainWindow):
         self.signals.connection_status.emit("Not connected")
         self.signals.status_message.emit("Disconnected")
 
+    # --- Colour / effect handlers ---
     def _pick_color(self) -> None:
         color = QtWidgets.QColorDialog.getColor(QtGui.QColor("#ffffff"), self, "Choose color")
         if not color.isValid():
             return
         rgb = (color.red(), color.green(), color.blue())
+
+        # Small coroutine so colour and brightness are sent one after the other.
         async def task():
             await self.manager.set_color(rgb)
             await self.manager.set_brightness(self.brightness_slider.value())
@@ -1374,8 +1458,11 @@ class SOSLampWindow(QtWidgets.QMainWindow):
 
     @staticmethod
     def _to_device_speed(slider_value: int) -> int:
+        # Currently 1:1 with the slider (clamped); kept as a function in case the mapping changes.
         return max(0, min(100, slider_value))
 
+    # NOTE: this reads self.schedule_widgets, but no schedule panel is built yet, so nothing
+    # calls it. The BLE layer already supports schedules; the GUI part is still TODO.
     def _apply_schedule(self, when: str) -> None:
         widgets = self.schedule_widgets[when]
         time_edit: QtWidgets.QTimeEdit = widgets["time"]
@@ -1387,6 +1474,7 @@ class SOSLampWindow(QtWidgets.QMainWindow):
         for cb, (_, value) in zip(day_checks, DAY_MAPPING):
             if cb.isChecked():
                 mask |= value
+        # No day ticked = treat it as every day.
         if mask == 0:
             mask = WEEK_DAYS.all
         self._run_async(
@@ -1394,6 +1482,9 @@ class SOSLampWindow(QtWidgets.QMainWindow):
             f"Schedule ({when}) saved",
         )
 
+    # --- Music Reactive handlers ---
+    # Most _apply_music_* methods just read their widgets and forward the values to music_worker.
+    # The matching _on_music_*_changed methods update the label text while a slider moves.
     def _refresh_audio_devices(self) -> None:
         try:
             self.audio_devices = list_input_devices()
@@ -1416,6 +1507,7 @@ class SOSLampWindow(QtWidgets.QMainWindow):
         if idx < 0 or idx >= len(self.audio_devices):
             return
         device_info = self.audio_devices[idx]
+        # Output devices can only be captured as loopback, so tick the box for the user.
         if device_info.supports_loopback and not self.loopback_checkbox.isChecked():
             self.loopback_checkbox.blockSignals(True)
             self.loopback_checkbox.setChecked(True)
@@ -1466,16 +1558,19 @@ class SOSLampWindow(QtWidgets.QMainWindow):
         self.music_worker.configure_ambient_fill(self.music_ambient_checkbox.isChecked())
 
     def _on_music_base_changed(self, value: int) -> None:
+        # Keep base <= max: pushing base above max drags the max slider up with it.
         if value > self.music_max_slider.value():
             self.music_max_slider.blockSignals(True)
             self.music_max_slider.setValue(value)
             self.music_max_slider.blockSignals(False)
             self._on_music_max_changed(value)
+        # While the user is dragging, wait until release to apply (avoids spamming the lamp).
         if not self.music_base_slider.isSliderDown():
             self._apply_music_brightness_settings()
         self._set_label_with_desc(self.music_base_label, "Base brightness", "floor on quiet", value)
 
     def _on_music_max_changed(self, value: int) -> None:
+        # Mirror of the base handler: lowering max below base drags base down.
         if value < self.music_base_slider.value():
             self.music_base_slider.blockSignals(True)
             self.music_base_slider.setValue(value)
@@ -1618,8 +1713,10 @@ class SOSLampWindow(QtWidgets.QMainWindow):
         self.music_worker.configure_vertical_pulse(enabled)
 
     def _apply_music_fast_mode(self) -> None:
+        """Toggle low-latency mode: save current settings, apply snappy ones, restore on disable."""
         enabled = self.music_fast_checkbox.isChecked()
 
+        # Set a widget's value without firing its valueChanged signal (we apply everything at the end).
         def set_value(widget, value):
             block = getattr(widget, "blockSignals", lambda _: None)
             block(True)
@@ -1627,6 +1724,7 @@ class SOSLampWindow(QtWidgets.QMainWindow):
             block(False)
 
         if enabled:
+            # Only snapshot once, so toggling twice can't overwrite the originals with fast values.
             if not self._fast_snapshot:
                 self._fast_snapshot = {
                     "buffer": self.music_buffer_spin.value(),
@@ -1677,6 +1775,7 @@ class SOSLampWindow(QtWidgets.QMainWindow):
             self._set_status("Fast mode disabled: restored previous settings.")
 
     def _apply_music_preset(self, name: str) -> None:
+        """Load a preset into all the widgets, then apply every setting to the worker."""
         preset = self.music_presets.get(name)
         if not preset:
             return
@@ -1686,6 +1785,7 @@ class SOSLampWindow(QtWidgets.QMainWindow):
             widget.setValue(value)
             widget.blockSignals(False)
 
+        # Step 1: update widgets silently (signals blocked so we don't apply a half-loaded preset).
         set_value(self.music_buffer_spin, int(preset["buffer"]))
         set_value(self.music_gain_spin, float(preset["gain"]))
         set_value(self.music_floor_spin, float(preset["floor"]))
@@ -1770,6 +1870,7 @@ class SOSLampWindow(QtWidgets.QMainWindow):
         self.music_ambient_checkbox.setChecked(bool(preset.get("ambient_fill", False)))
         self.music_ambient_checkbox.blockSignals(False)
 
+        # Step 2: apply everything once, now that all the widgets hold the new values.
         self._apply_music_audio_params()
         self._apply_music_smoothing()
         self._on_music_smoothing_changed(self.music_smoothing_slider.value())
@@ -1798,12 +1899,14 @@ class SOSLampWindow(QtWidgets.QMainWindow):
 
     @staticmethod
     def _set_label_with_desc(label: QtWidgets.QLabel, title: str, desc: str, value: int) -> None:
+        # Rich text lets the bracketed hint be smaller and greyer than the title.
         label.setTextFormat(QtCore.Qt.RichText)
         label.setText(
             f"{title} <span style='font-size:11px; color:#cfd3dc;'>({desc})</span>: {value}%"
         )
 
     def _update_music_preview(self, payload: tuple) -> None:
+        """Show the colour currently being sent to the lamp (connected to UiSignals.music_color)."""
         try:
             (r, g, b), brightness = payload
         except Exception:
@@ -1819,9 +1922,11 @@ class SOSLampWindow(QtWidgets.QMainWindow):
 
     def _toggle_music(self, enabled: bool) -> None:
         if enabled:
+            # Music mode and screen sync both control the colour, so only one may run at a time.
             if self.screen_sync_toggle.isChecked():
                 self.screen_sync_toggle.setChecked(False)
             controller = self.manager.controller()
+            # Can't react without a lamp: flip the button back and tell the user why.
             if controller is None:
                 self.music_toggle.setChecked(False)
                 self._set_status("Connect a device before enabling reactive mode.")
@@ -1852,6 +1957,7 @@ class SOSLampWindow(QtWidgets.QMainWindow):
             self.screen_sampler.stop()
             self._set_status("Screen color sync disabled")
 
+    # Small handlers that forward dropdown/slider changes to the screen sampler.
     def _on_screen_mode_changed(self, idx: int) -> None:
         mode = "dominant" if idx == 0 else "standout"
         self.screen_sampler.set_mode(mode)
@@ -1872,6 +1978,10 @@ class SOSLampWindow(QtWidgets.QMainWindow):
         self.screen_sampler.set_edge_emphasis(value / 100.0)
 
     def _run_async(self, coro, success_message: str | None = None) -> None:
+        """Run a coroutine on the asyncio thread and report the outcome in the status bar.
+
+        Used by nearly every button handler so errors show up in the UI instead of vanishing.
+        """
         future = self.executor.submit(coro)
 
         def _complete(fut) -> None:
@@ -1886,14 +1996,17 @@ class SOSLampWindow(QtWidgets.QMainWindow):
         future.add_done_callback(_complete)
 
     def _set_status(self, text: str) -> None:
+        # Message disappears after 5 seconds.
         self.status_bar.showMessage(text, 5000)
 
     def _update_connection_label(self, text: str) -> None:
         self.connection_label.setText(text)
+        # If the lamp disconnected, turn the music toggle off so the UI matches reality.
         if "Not connected" in text:
             self.music_toggle.setChecked(False)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802
+        # Clean shutdown: stop audio, drop the BLE connection, stop the asyncio thread.
         self.executor.submit(self.music_worker.stop())
         self.executor.submit(self.manager.disconnect())
         self.executor.stop()
