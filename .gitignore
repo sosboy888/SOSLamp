@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# PyInstaller output
+build/
+dist/
+
+# Local scratch / editor / tooling
+tmp/
+.claude/
+.vscode/
+.idea/
+.env
+
+# Separate projects that live in this folder but are not part of SOSLamp
+unityProj/
+elk-led-controller/
