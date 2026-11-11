@@ -1,4 +1,16 @@
-"""Audio reactive RGB engine."""
+"""Audio reactive RGB engine.
+
+How the pipeline works (roughly):
+  1. sounddevice captures a small buffer of samples on a background thread.
+  2. We run an FFT and group the result into frequency bands (bass/mid/high).
+  3. Band energy + "spectral flux" (how fast the spectrum changes = beats) are
+     turned into hues and brightness values.
+  4. The colours are pushed through an asyncio queue to whoever registered a
+     callback (MusicReactiveWorker -> the BLE strip).
+
+Two classes live here: ReactiveAudioEngine (the DSP) and MusicReactiveWorker
+(glue between the engine, GUI settings and the LED controller).
+"""
 
 from __future__ import annotations
 
@@ -24,11 +36,18 @@ from soslamp.utils.config import (
 
 logger = logging.getLogger(__name__)
 
+# One RGB colour, each channel 0-255.
 Color = tuple[int, int, int]
 
 
 class BeatTracker:
-    """Simple per-band onset detector with adaptive thresholds and refractory."""
+    """Simple per-band onset detector with adaptive thresholds and refractory.
+
+    An "onset" is a sudden jump in energy (a drum hit). For each band we keep a
+    running mean/variance of the flux and call it a hit when the new value is
+    well above the recent average. The refractory period stops one hit from
+    being counted several frames in a row.
+    """
 
     def __init__(
         self,
@@ -39,7 +58,9 @@ class BeatTracker:
         min_flux: float = 1e-4,
     ) -> None:
         self.bands = bands
+        # alpha = how quickly the running average adapts (bigger = faster).
         self.alpha = alpha
+        # thresh_k = how many standard deviations above the mean counts as a hit.
         self.thresh_k = thresh_k
         self.refractory_frames = max(1, refractory_frames)
         self.min_flux = min_flux
@@ -48,40 +69,53 @@ class BeatTracker:
         self._last_hit_frame = np.full(self.bands, -1e9, dtype=np.int64)
 
     def set_refractory_frames(self, frames: int) -> None:
+        """Change the minimum gap (in frames) between two hits on the same band."""
         self.refractory_frames = max(1, int(frames))
 
     def update(self, flux: np.ndarray, frame_idx: int) -> tuple[bool, np.ndarray, float]:
+        """Feed one frame of per-band flux.
+
+        Returns (any_hit, per_band_hits, strength) where strength is 0-4.
+        """
         if flux.ndim != 1:
             flux = flux.reshape(-1)
+        # If the number of bands changed, reset the stored statistics to match.
         if flux.size != self.bands:
             self.bands = int(flux.size)
             self._mean = np.zeros(self.bands, dtype=np.float32)
             self._mean_sq = np.zeros(self.bands, dtype=np.float32)
             self._last_hit_frame = np.full(self.bands, -1e9, dtype=np.int64)
         flux = np.maximum(flux.astype(np.float32), 0.0)
+        # Exponential moving average of the flux and of its square -> gives mean and variance.
         a = self.alpha
         self._mean = (1 - a) * self._mean + a * flux
         self._mean_sq = (1 - a) * self._mean_sq + a * flux * flux
         var = np.maximum(self._mean_sq - self._mean * self._mean, 0.0)
         std = np.sqrt(var + 1e-9)
         thresh = self._mean + self.thresh_k * std
+        # A hit needs to beat the adaptive threshold AND a small absolute minimum (ignores noise).
         hits = flux > np.maximum(thresh, self.min_flux)
         recent = (frame_idx - self._last_hit_frame) < self.refractory_frames
         hits = np.logical_and(hits, np.logical_not(recent))
         if np.any(hits):
             self._last_hit_frame = np.where(hits, frame_idx, self._last_hit_frame)
+        # Strength = how many standard deviations above the threshold, capped at 4.
         score = np.where(hits, (flux - thresh) / (std + 1e-6), 0.0)
         strength = float(np.clip(np.max(score) if score.size else 0.0, 0.0, 4.0))
         return bool(np.any(hits)), hits, strength
 
 
 class ReactiveAudioEngine:
+    """Captures audio and converts it into a list of LED colours every frame."""
+
     def __init__(self, leds: int = 60) -> None:
         self.leds = leds
+        # Queue of size 1: we only ever care about the newest frame (keeps latency low).
         self._queue: asyncio.Queue[list[Color]] = asyncio.Queue(maxsize=1)
         self._task: asyncio.Task | None = None
         self._dispatch_task: asyncio.Task | None = None
         self._stop = asyncio.Event()
+        # Functions to call with each new frame of colours.
         self._callbacks: deque[Callable[[Sequence[Color]], Awaitable[None]]] = deque()
         self.device = AUDIO_DEVICE
         self.loopback = False
@@ -91,17 +125,21 @@ class ReactiveAudioEngine:
         self.value_floor = AUDIO_VALUE_FLOOR
         self.value_boost = AUDIO_VALUE_BOOST
         self.silence_gate = AUDIO_SILENCE_GATE
+        # Everything below is tuning state. Most of it is set from the GUI via the set_*() methods.
         self.color_mode: str = "gradient"  # "gradient" or "dominant"
         self._noise_floor = AUDIO_SILENCE_GATE
         self._frame_idx = 0
         self._error_handler: Callable[[str], None] | None = None
+        # Audio devices can be picky, so we keep lists of channel counts / sample rates to try in order.
         self._channel_candidates: list[int] = [1, 2, 4, 6, 8]
         self._sample_rate_candidates: list[float] = [AUDIO_SAMPLE_RATE]
         self._forced_channels: int | None = None
+        # Unique object pushed into the queue to tell the dispatch loop to quit.
         self._stop_sentinel: object = object()
         self._prev_spectrum: np.ndarray | None = None
         self._flux_smoothed: float = 0.0
         self._flux_bass_smoothed: float = 0.0
+        # Transient = short loud hit (drum). These control how much a hit brightens the output.
         self._transient_gain: float = 12.0  # baseline flux scaling
         self._transient_ceiling: float = 1.5  # max additive bump
         self._transient_user_gain: float = 1.0  # user-controlled scalar
@@ -109,6 +147,7 @@ class ReactiveAudioEngine:
         self._limit_amount: float = 0.0
         self._beat_gate_enabled: bool = False
         self._beat_gate_threshold: float = 0.12
+        # Palette is a list of hues (0-1 on the colour wheel), one per frequency band.
         self._palette_base = np.array([0.00, 0.12, 0.28, 0.48, 0.66, 0.88], dtype=np.float32)
         self._palette = self._palette_base.copy()
         self._strobe_enabled: bool = False
@@ -136,6 +175,8 @@ class ReactiveAudioEngine:
         self._auto_gain_speed: float = 0.04
         self._centroid_hue_enabled: bool = False
         self._centroid_hue_amount: float = 0.15
+        # "Drop" detection: the music suddenly goes quiet (e.g. before the bass drops).
+        # We compare a slow and a fast average of the volume to spot it.
         self._drop_enabled: bool = False
         self._drop_ratio: float = 0.35
         self._drop_min_frames: int = 10
@@ -150,6 +191,8 @@ class ReactiveAudioEngine:
         self._vertical_fill_enabled: bool = False
         self._vertical_fill: float = 0.0
         self._samplerate: float = AUDIO_SAMPLE_RATE
+        # TODO: the auto-gain and centroid-hue attributes below are also set higher up in
+        # this method. The duplicates are harmless (same values) but should be cleaned up.
         self._auto_gain_enabled: bool = False
         self._auto_gain_target: float = 0.18
         self._auto_gain_state: float = 1.0
@@ -159,25 +202,32 @@ class ReactiveAudioEngine:
         self._beat_tracker = BeatTracker(bands=3)
 
     def register_callback(self, callback: Callable[[Sequence[Color]], Awaitable[None]]) -> None:
+        """Subscribe to colour frames (callback must be an async function)."""
         self._callbacks.append(callback)
         # Callback wrapper to allow simple broadcast messages.
+        # NOTE: this assigns a no-op notifier as a side effect of registering; it only works
+        # because registration happens before set_drop_notifier(). Worth moving to __init__.
         self._notify_drop = lambda _: None
 
     def configure_source(self, device: int | None, loopback: bool) -> None:
+        """Pick the audio device (None = default) and whether to record its output (loopback)."""
         self.device = device
         self.loopback = loopback
         self._rebuild_candidates(device, loopback)
 
     def _rebuild_candidates(self, device: int | None, loopback: bool) -> None:
+        """Work out which channel counts and sample rates are worth trying for this device."""
         try:
             info = sd.query_devices(device)
             max_in = int(info.get("max_input_channels", 0) or 0)
             max_out = int(info.get("max_output_channels", 0) or 0)
+            # Inputs report max_input_channels; loopback devices only report output channels.
             chosen = max_in if max_in > 0 else max_out
             if loopback and chosen == 0:
                 chosen = max_out
             chosen = max(1, chosen)
             self.channels = self._forced_channels or min(2, chosen)
+            # Try the preferred count first, then everything else, without duplicates.
             candidates = [self.channels, max_in, max_out, 8, 6, 4, 2, 1]
             self._channel_candidates = []
             for c in candidates:
@@ -203,6 +253,7 @@ class ReactiveAudioEngine:
                 self._forced_channels,
             )
         except Exception:
+            # Querying the device failed (unplugged?) so fall back to safe defaults.
             self.channels = self._forced_channels or 1
             self._channel_candidates = [self.channels]
             self._sample_rate_candidates = [AUDIO_SAMPLE_RATE]
@@ -215,6 +266,7 @@ class ReactiveAudioEngine:
             )
 
     def _find_loopback_device(self) -> int | None:
+        """Fallback search for a WASAPI output device we can record from (Windows only)."""
         try:
             devices = sd.query_devices()
             hostapis = sd.query_hostapis()
@@ -228,6 +280,7 @@ class ReactiveAudioEngine:
             max_out = int(dev.get("max_output_channels", 0) or 0)
             name = dev.get("name", "")
             if max_out > 0 and "wasapi" in host_name.lower():
+                # Lower score = better. Devices matching the user's selected name get priority.
                 score = 0
                 if self.device is not None:
                     try:
@@ -253,6 +306,10 @@ class ReactiveAudioEngine:
         silence_gate: float | None = None,
         forced_channels: int | None = None,
     ) -> None:
+        """Update capture/level settings. Every value is clamped to a safe range.
+
+        Passing None means "leave this one as it is".
+        """
         if buffer_size is not None:
             self.buffer_size = max(64, min(4096, int(buffer_size)))
         if gain is not None:
@@ -271,8 +328,10 @@ class ReactiveAudioEngine:
             self._channel_candidates = [fc]
             self._sample_rate_candidates = [AUDIO_SAMPLE_RATE]
             self._rebuild_candidates(self.device, self.loopback)
+        # Buffer size / sample rate changed, so the frame rate (and refractory time) changed too.
         self._update_beat_tracker_refractory()
 
+    # --- Simple setters used by the GUI (each one validates/clamps its input) ---
     def set_color_mode(self, mode: str) -> None:
         self.color_mode = mode
 
@@ -310,6 +369,7 @@ class ReactiveAudioEngine:
             self._beat_gate_threshold = float(np.clip(threshold, 0.01, 0.5))
 
     def _update_beat_tracker_refractory(self) -> None:
+        # Keep the refractory period around 90 ms no matter the buffer size / sample rate.
         frames_per_second = self._samplerate / max(self.buffer_size, 1)
         refractory = int(np.clip(0.09 * frames_per_second, 2, 24))
         self._beat_tracker.set_refractory_frames(refractory)
@@ -321,6 +381,7 @@ class ReactiveAudioEngine:
                 self._palette_base = np.mod(arr, 1.0)
                 self._palette = self._palette_base.copy()
         except Exception:
+            # Bad palette input from the GUI: keep the old palette rather than crash.
             pass
 
     def set_strobe(self, enabled: bool, strength: float, threshold: float | None = None) -> None:
@@ -362,6 +423,7 @@ class ReactiveAudioEngine:
         self._drop_callback = callback
 
     async def start(self) -> None:
+        """Reset all per-run state and launch the capture + dispatch tasks."""
         if self._task:
             return
         self._drain_queue()
@@ -375,12 +437,15 @@ class ReactiveAudioEngine:
         self._melody_conf = 0.0
         self._vertical_fill = 0.0
         loop = asyncio.get_running_loop()
+        # Capture runs in a thread (blocking reads); dispatch runs on the event loop.
         self._task = asyncio.create_task(self._capture_loop(loop))
         self._dispatch_task = asyncio.create_task(self._dispatch_loop())
 
     async def stop(self) -> None:
+        """Signal both tasks to finish and wait for them."""
         running = bool(self._task or self._dispatch_task)
         self._stop.set()
+        # Wake the dispatch loop up (it's blocked on queue.get()) by sending the sentinel.
         if running:
             try:
                 self._queue.put_nowait(self._stop_sentinel)
@@ -399,6 +464,7 @@ class ReactiveAudioEngine:
         self._dispatch_task = None
 
     def _drain_queue(self) -> None:
+        # Throw away any old frames left over from the previous run.
         while not self._queue.empty():
             try:
                 self._queue.get_nowait()
@@ -406,6 +472,7 @@ class ReactiveAudioEngine:
                 break
 
     async def _dispatch_loop(self) -> None:
+        # Pull frames off the queue and hand each to every callback at the same time.
         while not self._stop.is_set():
             colors = await self._queue.get()
             if colors is self._stop_sentinel:
@@ -413,12 +480,18 @@ class ReactiveAudioEngine:
             await asyncio.gather(*(cb(colors) for cb in self._callbacks), return_exceptions=True)
 
     async def _capture_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        # stream.read() blocks, so run the whole capture loop in a worker thread.
         await asyncio.to_thread(self._capture_blocking, loop)
 
     def _capture_blocking(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Open the audio stream (trying fallbacks) then read from it until stopped.
+
+        Runs on a worker thread, so it talks to the event loop with call_soon_threadsafe.
+        """
         def _extra_settings_options() -> list:
             if not self.loopback:
                 return [None]
+            # Try exclusive mode first (lower latency), then shared mode.
             opts = []
             try:
                 opts.append(sd.WasapiSettings(loopback=True, exclusive=True))
@@ -440,6 +513,7 @@ class ReactiveAudioEngine:
             )
 
         stream = None
+        # Keep a record of every combination tried so the error message is useful.
         attempts = []
         devices_to_try = [self.device]
         if self.loopback:
@@ -448,6 +522,8 @@ class ReactiveAudioEngine:
                 devices_to_try.append(alt)
             devices_to_try.append(None)  # default output loopback
 
+        # Brute force: try every device / sample rate / channel count / mode until one opens.
+        # It's a lot of nested loops but audio drivers are unpredictable.
         for dev in devices_to_try:
             self._rebuild_candidates(dev, self.loopback)
             for sr in self._sample_rate_candidates:
@@ -486,12 +562,14 @@ class ReactiveAudioEngine:
                     break
             if stream:
                 break
+        # Nothing worked: tell the GUI (if it registered an error handler) and give up.
         if stream is None:
             msg = f"Audio input stream failed for device {self.device} (tried {attempts})"
             logger.error(msg)
             if self._error_handler:
                 self._error_handler(msg)
             return
+        # `with stream:` starts the stream and guarantees it is closed afterwards.
         with stream:
             while not self._stop.is_set():
                 samples, _ = stream.read(self.buffer_size)
@@ -500,6 +578,7 @@ class ReactiveAudioEngine:
                     # Some devices present interleaved/stereo data; collapse to mono to keep FFT shapes aligned.
                     np_samples = np.mean(np_samples, axis=1)
                 colors = self._samples_to_colors(np_samples)
+                # Hand the result back to the asyncio thread safely.
                 loop.call_soon_threadsafe(self._enqueue_colors, colors)
 
     def _enqueue_colors(self, colors: list[Color]) -> None:
@@ -517,24 +596,31 @@ class ReactiveAudioEngine:
             pass
 
     def _samples_to_colors(self, samples: np.ndarray) -> list[Color]:
+        """The main DSP step: one buffer of audio in, one list of LED colours out."""
         if samples.size == 0:
             return [(255, 255, 255)] * self.leds
+        # Hanning window smooths the edges of the buffer so the FFT has fewer artefacts.
         samples = samples * np.hanning(samples.size)
+        # RMS = overall loudness of this buffer.
         rms = float(np.sqrt(np.mean(np.square(samples)))) if samples.size else 0.0
+        # Slowly track the background noise level so quiet hiss doesn't light the strip.
         self._noise_floor = 0.995 * self._noise_floor + 0.005 * rms
         if rms < max(self.silence_gate, self._noise_floor * 1.4):
             return [(0, 0, 0)] * self.leds
+        # rfft = FFT for real input; magnitude tells us how strong each frequency is.
         fft = np.fft.rfft(samples)
         magnitude = np.abs(fft)
         n = magnitude.shape[0]
         freqs = np.fft.rfftfreq(samples.size, d=1.0 / max(self._samplerate, 1.0)) if samples.size else np.array([])
 
+        # Average magnitude over a slice of FFT bins (clamped so we never index past the end).
         def band_mean(start: int, end: int) -> float:
             s = min(end, n)
             if start >= s:
                 return 0.0
             return float(magnitude[start:s].mean()) if s > start else 0.0
 
+        # Bin ranges are hand-picked by ear rather than exact Hz (depends on buffer size).
         bands = [
             band_mean(1, 15),    # sub bass
             band_mean(15, 35),   # bass
@@ -543,11 +629,13 @@ class ReactiveAudioEngine:
             band_mean(140, 220), # highs
             band_mean(220, 320), # sparkle
         ]
+        # Normalise against the loudest bin so band values end up between 0 and 1.
         scale = float(np.max(magnitude)) if n else 0.0
         if scale <= 1e-9:
             # Silence: return black so downstream can fade out.
             return [(0, 0, 0)] * self.leds
         gain = self.gain
+        # Auto gain (AGC): nudge the gain so quiet and loud songs end up similarly bright.
         if self._auto_gain_enabled and rms > 1e-6:
             target = self._auto_gain_target
             # Simple AGC: move state toward target/rms.
@@ -589,6 +677,7 @@ class ReactiveAudioEngine:
                 dtype=np.float32,
             )
         # Spectral flux (positive deltas) gives transient/beat emphasis.
+        # i.e. compare this frame's spectrum to the last one; a big increase = a hit.
         if self._prev_spectrum is None or self._prev_spectrum.shape != magnitude.shape:
             self._prev_spectrum = magnitude
         prev_spec = self._prev_spectrum
@@ -615,6 +704,7 @@ class ReactiveAudioEngine:
         else:
             flux_bands = np.zeros(3, dtype=np.float32)
         beat_hit, band_hits, beat_strength = self._beat_tracker.update(flux_bands, self._frame_idx)
+        # Give the bass bands an extra kick based on recent bass flux.
         if bands.size >= 2:
             bass_hit = np.clip(self._flux_bass_smoothed * 1.8, 0.0, 3.0)
             bands[0:2] *= 1.0 + 0.35 * bass_hit
@@ -626,6 +716,8 @@ class ReactiveAudioEngine:
         transient_boost = 1.0 + np.clip(flux_mix * flux_scale, 0.0, self._transient_ceiling)
         if beat_hit:
             transient_boost = min(max(transient_boost, 1.0 + 0.6 * beat_strength), 1.0 + self._transient_ceiling)
+        # Melody focus: find the strongest frequency in the vocal/instrument range and
+        # use its pitch to shift the hue slightly.
         melody_weight = 0.0
         melody_bias = 0.0
         if self._melody_enabled and n > 4:
@@ -643,6 +735,8 @@ class ReactiveAudioEngine:
                 melody_bias = 0.35 * melody_weight * (pitch_norm - 0.5)
                 if bands.size >= 4:
                     bands[2:] *= 1.0 + 0.35 * melody_weight
+        # Drop detection: a drop = loudness AND flux both fall well below their recent levels
+        # for several frames in a row. A cooldown stops it firing repeatedly.
         if self._drop_enabled:
             # Track a decaying flux peak so we can require both energy and flux to fall.
             self._flux_peak = max(flux_mix, 0.92 * self._flux_peak + 0.08 * flux_mix)
@@ -675,6 +769,7 @@ class ReactiveAudioEngine:
                             pass
             else:
                 self._drop_active_frames = 0
+        # Beat gate: if there's no beat energy, mute the mids/highs so only bass drives the lights.
         gate_thresh = self._beat_gate_threshold
         if melody_weight > 0.01:
             gate_thresh *= 1.0 - 0.4 * melody_weight
@@ -682,6 +777,7 @@ class ReactiveAudioEngine:
             # Suppress mids/highs when beat energy is low; keep bass-driven motion.
             bands[2:] *= 0.1
             transient_boost *= 0.7
+        # Strobe: jump up to full strength on a hit, then decay back down each frame.
         if self._strobe_enabled:
             if flux_raw > self._strobe_threshold or beat_hit:
                 self._strobe_level = max(self._strobe_level, self._strobe_strength)
@@ -690,15 +786,19 @@ class ReactiveAudioEngine:
         else:
             self._strobe_level = 0.0
         self._frame_idx += 1
+        # Hue bias shifts the palette. Centroid = the "centre of mass" of the spectrum:
+        # brighter-sounding music has a higher centroid, so it moves the colours up.
         hue_bias = 0.0
         if self._centroid_hue_enabled and magnitude.sum() > 1e-9:
             freqs = np.linspace(0.0, 1.0, n)
             centroid = float(np.sum(freqs * magnitude) / (np.sum(magnitude) + 1e-9))
             hue_bias = self._centroid_hue_amount * (centroid - 0.5)
         hue_bias += melody_bias
+        # The 0.02 * frame_idx term slowly rotates the whole palette over time.
         palette_hues = (self._palette + 0.02 * self._frame_idx + hue_bias) % 1.0
         fill_target = float(np.clip(bands.max() * transient_boost, 0.0, 1.0))
         self._vertical_fill = 0.72 * self._vertical_fill + 0.28 * fill_target
+        # Mode 1 - "dominant": the whole strip is one colour, taken from the loudest band.
         if self.color_mode == "dominant":
             idx = int(np.argmax(bands))
             hue = palette_hues[idx]
@@ -706,6 +806,8 @@ class ReactiveAudioEngine:
             if self._vertical_fill_enabled:
                 value *= float(np.clip(self._vertical_fill, 0.05, 1.0))
             return [self._hsv_to_rgb(hue, 1.0, value)] * self.leds
+        # Mode 2 - "gradient": each band gets a slice of the strip proportional to its energy,
+        # and we interpolate hue/brightness between the slices.
         weights = bands / (bands.sum() + 1e-6)
         weights = np.clip(weights, 0.05, None)
         weights = weights / weights.sum()
@@ -719,12 +821,14 @@ class ReactiveAudioEngine:
             progress = float(np.clip(self._vertical_fill, 0.0, 1.0))
             mask = np.clip((progress - pixels) / 0.2, 0.0, 1.0)
             vals = np.clip(vals * mask, 0.0, 1.0)
+        # Full saturation everywhere; colours are built in HSV and converted to RGB.
         sats = np.ones_like(hues)
         rgb = [self._hsv_to_rgb(h % 1.0, s, v) for h, s, v in zip(hues, sats, vals)]
         if self._flash_enabled:
             self._flash_phase = (self._flash_phase + 1) % max(1, self._flash_rate_frames)
             if self._flash_phase == 0:
                 rgb = [self._hsv_to_rgb(h % 1.0, 1.0, v) for h, v in zip(hues, vals)]
+        # Flicker: multiply each LED by a small random factor for a candle-like effect.
         if self._flicker_enabled and self._flicker_amount > 0.0:
             noise = 1.0 + self._flicker_amount * (np.random.rand(self.leds) - 0.5)
             rgb = [
@@ -738,7 +842,12 @@ class ReactiveAudioEngine:
 
     @staticmethod
     def _hsv_to_rgb(h: float, s: float, v: float) -> Color:
+        """Convert HSV (all 0-1) to an (R, G, B) tuple of 0-255 ints.
+
+        Written by hand (instead of colorsys) so it can stay fast and return ints directly.
+        """
         h = h % 1.0
+        # The colour wheel is split into 6 sectors; i is the sector, f how far through it we are.
         i = int(h * 6)
         f = h * 6 - i
         p = int(255 * v * (1 - s))
@@ -760,7 +869,15 @@ class ReactiveAudioEngine:
 
 
 class MusicReactiveWorker:
+    """Connects the audio engine to the LED controller and applies GUI settings.
+
+    The engine produces a list of colours per frame, but the BLE strips can only show
+    ONE colour + one brightness at a time, so _collapse() averages the list down.
+    """
+
     def __init__(self, controller_provider, leds: int = 60) -> None:
+        # controller_provider is a function returning the current controller (or None),
+        # so the worker always uses whichever device is connected right now.
         self.controller_provider = controller_provider
         self.engine = ReactiveAudioEngine(leds=leds)
         self.engine.register_callback(self._on_colors)
@@ -768,10 +885,13 @@ class MusicReactiveWorker:
         self._brightness_floor = MUSIC_BASE_BRIGHTNESS
         self._brightness_ceiling = MUSIC_MAX_BRIGHTNESS
         self._level_reactive = True
+        # keep_lit = stay on at the minimum brightness during silence instead of going dark.
         self._keep_lit = False
+        # Remember the last value sent so we skip redundant BLE writes.
         self._last_brightness: int | None = None
         self._last_rgb: np.ndarray | None = None
         self._color_smoothing = 0.3  # 0=no smoothing, 0.9=very smooth
+        # Optional callback so the GUI can show a live colour preview.
         self._observer: Callable[[Color, int], None] | None = None
         self._transient_boost = 1.2
         self.engine.set_transient_boost(self._transient_boost)
@@ -821,8 +941,12 @@ class MusicReactiveWorker:
         self._drop_active_frames = 0
         self._drop_callback = None
         self._notify_drop: Callable[[str], None] | None = None
+        # NOTE: configure_drop_detector() uses self._notify_ui, which is only created by
+        # set_drop_notifier(). The GUI must call that first. Initialising it here as a
+        # no-op would be safer (TODO).
 
     async def start(self) -> None:
+        """Begin reacting to audio."""
         if self._active:
             return
         self._active = True
@@ -831,12 +955,14 @@ class MusicReactiveWorker:
         await self.engine.start()
 
     async def stop(self) -> None:
+        """Stop reacting and forget the cached colour/brightness."""
         self._active = False
         await self.engine.stop()
         self._last_brightness = None
         self._last_rgb = None
 
     async def set_audio_source(self, device: int | None, loopback: bool) -> None:
+        """Switch audio device, restarting capture if it was running."""
         was_running = self._active
         if was_running:
             await self.engine.stop()
@@ -845,6 +971,7 @@ class MusicReactiveWorker:
             await self.engine.start()
             self._active = True
 
+    # Changing buffer size etc. needs the stream reopened, hence stop -> configure -> start.
     async def apply_audio_params(
         self,
         buffer_size: int | None = None,
@@ -872,6 +999,7 @@ class MusicReactiveWorker:
         self._last_brightness = None
 
     def configure_brightness(self, base: int, ceiling: int, adaptive: bool) -> None:
+        """Set the min/max strip brightness; adaptive=True makes it follow loudness."""
         base = int(np.clip(base, 1, 100))
         ceiling = int(np.clip(ceiling, base, 100))
         self._brightness_floor = base
@@ -883,6 +1011,7 @@ class MusicReactiveWorker:
         if enabled and self._last_nonzero_rgb is None and self._last_rgb is not None:
             self._last_nonzero_rgb = self._last_rgb
 
+    # Same as apply_audio_params but doesn't restart the stream (for live slider changes).
     def configure_audio_params(
         self,
         buffer_size: int | None = None,
@@ -905,6 +1034,7 @@ class MusicReactiveWorker:
     def set_observer(self, observer: Callable[[Color, int], None] | None) -> None:
         self._observer = observer
 
+    # The configure_* methods below clamp the value, store it, and forward it to the engine.
     def configure_smoothing(self, amount: float) -> None:
         # amount in [0, 1]; stored as blend weight of previous color.
         self._color_smoothing = float(np.clip(amount, 0.0, 0.95))
@@ -998,8 +1128,10 @@ class MusicReactiveWorker:
 
     def set_drop_notifier(self, notifier: Callable[[str], None]) -> None:
         self._notify_ui = notifier
+
     @staticmethod
     def _default_palette(name: str) -> list[float]:
+        # Each list is 6 hues (0-1 on the colour wheel), one for each frequency band.
         palettes = {
             "Default": [0.00, 0.12, 0.28, 0.48, 0.66, 0.88],
             "Sunset": [0.98, 0.04, 0.06, 0.10, 0.13, 0.16],
@@ -1011,9 +1143,11 @@ class MusicReactiveWorker:
             "Currents": [0.11, 0.17, 0.32, 0.47, 0.59, 0.73],
             "Slow Rush": [0.03, 0.08, 0.14, 0.58, 0.66, 0.72],
         }
+        # Unknown names fall back to the default palette.
         return palettes.get(name, palettes["Default"])
 
     async def _on_colors(self, colors: Sequence[Color]) -> None:
+        """Engine callback: turn a frame of colours into BLE commands."""
         if not self._active:
             return
         controller = self.controller_provider()
@@ -1025,8 +1159,10 @@ class MusicReactiveWorker:
                 self._observer(rgb, brightness)
             except Exception:
                 pass
+        # Errors are swallowed on purpose: one failed BLE write shouldn't stop the show.
         try:
             await controller.set_color(*rgb)
+            # Brightness only changes when needed to save BLE traffic.
             if brightness != self._last_brightness:
                 await controller.set_brightness(brightness)
                 self._last_brightness = brightness
@@ -1034,10 +1170,12 @@ class MusicReactiveWorker:
             pass
 
     def _collapse(self, colors: Sequence[Color]) -> tuple[Color, int]:
+        """Reduce a list of per-LED colours to one (rgb, brightness) pair for the strip."""
         arr = np.array(colors, dtype=np.float32)
         if arr.size == 0:
             return (255, 255, 255), self._brightness_floor
         avg = arr.mean(axis=0)
+        # Smoothing = blend with the previous colour so changes fade instead of jumping.
         if self._color_smoothing > 0 and self._last_rgb is not None:
             avg = self._color_smoothing * self._last_rgb + (1 - self._color_smoothing) * avg
         self._last_rgb = avg
@@ -1048,10 +1186,15 @@ class MusicReactiveWorker:
         env_peak = float(np.max(self._band_env)) if self._band_env.size else 0.0
         intensity_raw = float(np.clip(arr.max() / 255.0, 0.0, 1.0))
         intensity = float(np.power(max(intensity_raw, env_peak), 0.6))  # expand low-level dynamics
+        # NOTE: self._band_env here is the worker's own array, which stays all zeros;
+        # the live envelope is on self.engine. Probably meant to read from the engine.
         if self._limit_amount > 0.0 and intensity > 0.6:
             # Soft limiter: compress peaks above threshold.
             over = intensity - 0.6
             intensity = 0.6 + over / (1 + self._limit_amount * 4.0)
+        # Silence handling: either a rainbow idle (ambient), hold the last colour (keep lit) or go dark.
+        # NOTE: the ambient branch calls self._hsv_to_rgb, which only exists on the engine class.
+        # TODO: use ReactiveAudioEngine._hsv_to_rgb here.
         if intensity <= self.engine.silence_gate:
             if self._ambient_fill:
                 brightness = self._brightness_floor
@@ -1061,6 +1204,7 @@ class MusicReactiveWorker:
                 rgb = tuple(int(np.clip(v, 0, 255)) for v in rgb_arr)
             elif self._keep_lit:
                 brightness = self._brightness_floor
+                # NOTE: `or` on numpy arrays raises "truth value is ambiguous"; needs an explicit None check (TODO).
                 fallback = self._last_nonzero_rgb or self._last_rgb
                 if fallback is None:
                     fallback = np.array([255.0, 255.0, 255.0], dtype=np.float32)
@@ -1071,10 +1215,12 @@ class MusicReactiveWorker:
                 rgb = (0, 0, 0)
                 self._last_rgb = None
         elif self._level_reactive:
+            # Map loudness (0-1) onto the allowed brightness range.
             span = max(1, self._brightness_ceiling - self._brightness_floor)
             brightness = int(self._brightness_floor + intensity * span)
         else:
             brightness = self._brightness_ceiling
+        # Final safety clamp (but keep 0 as "off").
         if brightness > 0:
             brightness = int(np.clip(brightness, self._brightness_floor, self._brightness_ceiling))
         return rgb, brightness
