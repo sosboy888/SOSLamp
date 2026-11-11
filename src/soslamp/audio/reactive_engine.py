@@ -191,23 +191,13 @@ class ReactiveAudioEngine:
         self._vertical_fill_enabled: bool = False
         self._vertical_fill: float = 0.0
         self._samplerate: float = AUDIO_SAMPLE_RATE
-        # TODO: the auto-gain and centroid-hue attributes below are also set higher up in
-        # this method. The duplicates are harmless (same values) but should be cleaned up.
-        self._auto_gain_enabled: bool = False
-        self._auto_gain_target: float = 0.18
-        self._auto_gain_state: float = 1.0
-        self._auto_gain_speed: float = 0.04
-        self._centroid_hue_enabled: bool = False
-        self._centroid_hue_amount: float = 0.15
+        # Optional text notifier for drop events; a no-op until the GUI sets one.
+        self._notify_drop: Callable[[str], None] | None = lambda _msg: None
         self._beat_tracker = BeatTracker(bands=3)
 
     def register_callback(self, callback: Callable[[Sequence[Color]], Awaitable[None]]) -> None:
         """Subscribe to colour frames (callback must be an async function)."""
         self._callbacks.append(callback)
-        # Callback wrapper to allow simple broadcast messages.
-        # NOTE: this assigns a no-op notifier as a side effect of registering; it only works
-        # because registration happens before set_drop_notifier(). Worth moving to __init__.
-        self._notify_drop = lambda _: None
 
     def configure_source(self, device: int | None, loopback: bool) -> None:
         """Pick the audio device (None = default) and whether to record its output (loopback)."""
@@ -595,6 +585,57 @@ class ReactiveAudioEngine:
         except asyncio.QueueFull:
             pass
 
+    def _update_drop_detector(self, rms: float, flux_mix: float) -> bool:
+        """Track loudness/flux and return True on the frame a "drop" is detected.
+
+        A drop = loudness AND flux both fall well below their recent levels for several
+        frames in a row. A cooldown stops it firing repeatedly.
+
+        This is called for every frame, including the ones the silence gate turns black.
+        (It used to run only on loud frames, so when the music really went quiet the gate
+        returned early and a drop could almost never be detected.)
+        """
+        if not self._drop_enabled:
+            return False
+        # Track a decaying flux peak so we can require both energy and flux to fall.
+        self._flux_peak = max(flux_mix, 0.92 * self._flux_peak + 0.08 * flux_mix)
+        self._drop_slow = self._drop_decay * self._drop_slow + (1 - self._drop_decay) * rms
+        self._drop_fast = 0.6 * self._drop_fast + 0.4 * rms
+        # Only count it as a drop if there was audible music to drop *from*; otherwise silence
+        # (0 < ratio * ~0) would look like an endless series of drops.
+        energy_drop = (
+            self._drop_slow > self.silence_gate
+            and self._drop_fast < self._drop_ratio * self._drop_slow
+        )
+        flux_drop = flux_mix < 0.45 * max(self._flux_peak, 1e-6)
+        if self._drop_cooldown > 0:
+            self._drop_cooldown -= 1
+            return False
+        if not (energy_drop and flux_drop):
+            self._drop_active_frames = 0
+            return False
+        self._drop_active_frames += 1
+        if self._drop_active_frames < self._drop_min_frames:
+            return False
+        self._drop_cooldown = self._drop_cooldown_frames
+        self._drop_active_frames = 0
+        msg = (
+            f"Drop detected (fast={self._drop_fast:.4f}, slow={self._drop_slow:.4f}, "
+            f"flux={flux_mix:.4f}, peak={self._flux_peak:.4f})"
+        )
+        logger.info(msg)
+        if self._drop_callback:
+            try:
+                self._drop_callback()
+            except Exception:
+                pass
+        if self._notify_drop:
+            try:
+                self._notify_drop(msg)
+            except Exception:
+                pass
+        return True
+
     def _samples_to_colors(self, samples: np.ndarray) -> list[Color]:
         """The main DSP step: one buffer of audio in, one list of LED colours out."""
         if samples.size == 0:
@@ -606,6 +647,8 @@ class ReactiveAudioEngine:
         # Slowly track the background noise level so quiet hiss doesn't light the strip.
         self._noise_floor = 0.995 * self._noise_floor + 0.005 * rms
         if rms < max(self.silence_gate, self._noise_floor * 1.4):
+            # Quiet frame: still feed the drop detector (no flux = 0.0), then show black.
+            self._update_drop_detector(rms, 0.0)
             return [(0, 0, 0)] * self.leds
         # rfft = FFT for real input; magnitude tells us how strong each frequency is.
         fft = np.fft.rfft(samples)
@@ -633,6 +676,7 @@ class ReactiveAudioEngine:
         scale = float(np.max(magnitude)) if n else 0.0
         if scale <= 1e-9:
             # Silence: return black so downstream can fade out.
+            self._update_drop_detector(rms, 0.0)
             return [(0, 0, 0)] * self.leds
         gain = self.gain
         # Auto gain (AGC): nudge the gain so quiet and loud songs end up similarly bright.
@@ -735,40 +779,9 @@ class ReactiveAudioEngine:
                 melody_bias = 0.35 * melody_weight * (pitch_norm - 0.5)
                 if bands.size >= 4:
                     bands[2:] *= 1.0 + 0.35 * melody_weight
-        # Drop detection: a drop = loudness AND flux both fall well below their recent levels
-        # for several frames in a row. A cooldown stops it firing repeatedly.
-        if self._drop_enabled:
-            # Track a decaying flux peak so we can require both energy and flux to fall.
-            self._flux_peak = max(flux_mix, 0.92 * self._flux_peak + 0.08 * flux_mix)
-            self._drop_slow = self._drop_decay * self._drop_slow + (1 - self._drop_decay) * rms
-            self._drop_fast = 0.6 * self._drop_fast + 0.4 * rms
-            energy_drop = self._drop_fast < self._drop_ratio * max(self._drop_slow, 1e-6)
-            flux_drop = flux_mix < 0.45 * max(self._flux_peak, 1e-6)
-            if self._drop_cooldown > 0:
-                self._drop_cooldown -= 1
-            elif energy_drop and flux_drop:
-                self._drop_active_frames += 1
-                if self._drop_active_frames >= self._drop_min_frames:
-                    self._drop_cooldown = self._drop_cooldown_frames
-                    self._drop_active_frames = 0
-                    msg = (
-                        f"Drop detected (fast={self._drop_fast:.4f}, slow={self._drop_slow:.4f}, "
-                        f"flux={flux_mix:.4f}, peak={self._flux_peak:.4f})"
-                    )
-                    logger.info(msg)
-                    if self._drop_callback:
-                        try:
-                            self._drop_callback()
-                        except Exception:
-                            pass
-                    transient_boost *= 1.3
-                    if self._notify_drop:
-                        try:
-                            self._notify_drop(msg)
-                        except Exception:
-                            pass
-            else:
-                self._drop_active_frames = 0
+        # Drop detection (see _update_drop_detector); a drop gives the frame a small extra boost.
+        if self._update_drop_detector(rms, flux_mix):
+            transient_boost *= 1.3
         # Beat gate: if there's no beat energy, mute the mids/highs so only bass drives the lights.
         gate_thresh = self._beat_gate_threshold
         if melody_weight > 0.01:
@@ -929,7 +942,6 @@ class MusicReactiveWorker:
         self._vertical_pulse = False
         self.engine.set_vertical_fill(self._vertical_pulse)
         self._last_nonzero_rgb = None
-        self._band_env = np.zeros(6, dtype=np.float32)
         self._drop_enabled = False
         self._drop_ratio = 0.35
         self._drop_min_frames = 10
@@ -940,10 +952,9 @@ class MusicReactiveWorker:
         self._drop_cooldown = 0
         self._drop_active_frames = 0
         self._drop_callback = None
-        self._notify_drop: Callable[[str], None] | None = None
-        # NOTE: configure_drop_detector() uses self._notify_ui, which is only created by
-        # set_drop_notifier(). The GUI must call that first. Initialising it here as a
-        # no-op would be safer (TODO).
+        # Text notifier for drop events (set by the GUI). Defaults to a no-op so
+        # configure_drop_detector() works even if no notifier was registered.
+        self._notify_ui: Callable[[str], None] = lambda _msg: None
 
     async def start(self) -> None:
         """Begin reacting to audio."""
@@ -1183,29 +1194,28 @@ class MusicReactiveWorker:
         rgb = tuple(int(np.clip(v, 0, 255)) for v in avg)
         if max(rgb) > 0:
             self._last_nonzero_rgb = avg
-        env_peak = float(np.max(self._band_env)) if self._band_env.size else 0.0
+        # The live band envelope is kept by the engine (the worker has no envelope of its own).
+        band_env = self.engine._band_env
+        env_peak = float(np.max(band_env)) if band_env.size else 0.0
         intensity_raw = float(np.clip(arr.max() / 255.0, 0.0, 1.0))
         intensity = float(np.power(max(intensity_raw, env_peak), 0.6))  # expand low-level dynamics
-        # NOTE: self._band_env here is the worker's own array, which stays all zeros;
-        # the live envelope is on self.engine. Probably meant to read from the engine.
         if self._limit_amount > 0.0 and intensity > 0.6:
             # Soft limiter: compress peaks above threshold.
             over = intensity - 0.6
             intensity = 0.6 + over / (1 + self._limit_amount * 4.0)
         # Silence handling: either a rainbow idle (ambient), hold the last colour (keep lit) or go dark.
-        # NOTE: the ambient branch calls self._hsv_to_rgb, which only exists on the engine class.
-        # TODO: use ReactiveAudioEngine._hsv_to_rgb here.
         if intensity <= self.engine.silence_gate:
             if self._ambient_fill:
                 brightness = self._brightness_floor
-                rgb_arr = np.array(self._hsv_to_rgb(self._ambient_hue, 1.0, 1.0), dtype=np.float32)
+                rgb_arr = np.array(ReactiveAudioEngine._hsv_to_rgb(self._ambient_hue, 1.0, 1.0), dtype=np.float32)
                 self._last_rgb = rgb_arr
                 self._last_nonzero_rgb = rgb_arr
                 rgb = tuple(int(np.clip(v, 0, 255)) for v in rgb_arr)
             elif self._keep_lit:
                 brightness = self._brightness_floor
-                # NOTE: `or` on numpy arrays raises "truth value is ambiguous"; needs an explicit None check (TODO).
-                fallback = self._last_nonzero_rgb or self._last_rgb
+                # Hold the last colour that wasn't black. (Explicit None check: `a or b` raises on
+                # numpy arrays. _last_rgb is no use here: it was already overwritten with black above.)
+                fallback = self._last_nonzero_rgb
                 if fallback is None:
                     fallback = np.array([255.0, 255.0, 255.0], dtype=np.float32)
                 rgb_arr = fallback
